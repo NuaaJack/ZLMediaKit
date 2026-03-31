@@ -106,7 +106,6 @@ void HttpCookieManager::onManager() {
             if (it_cookie->second->isExpired()) {
                 // cookie过期,移除记录  [AUTO-TRANSLATED:8b48b8a2]
                 // Cookie expired, remove record
-                DebugL << it_cookie->second->getUid() << " cookie过期:" << it_cookie->second->getCookie();
                 it_cookie = it_name->second.erase(it_cookie);
                 continue;
             }
@@ -116,7 +115,6 @@ void HttpCookieManager::onManager() {
         if (it_name->second.empty()) {
             // 该类型下没有任何cookie记录,移除之  [AUTO-TRANSLATED:92e3b783]
             // There are no cookie records under this type, remove it
-            DebugL << "该path下没有任何cookie记录:" << it_name->first;
             it_name = _map_cookie.erase(it_name);
             continue;
         }
@@ -161,7 +159,6 @@ HttpServerCookie::Ptr HttpCookieManager::getCookie(const string &cookie_name, co
     if (it_cookie->second->isExpired()) {
         // cookie过期  [AUTO-TRANSLATED:a980453f]
         // Cookie expired
-        DebugL << "cookie过期:" << it_cookie->second->getCookie();
         it_name->second.erase(it_cookie);
         return nullptr;
     }

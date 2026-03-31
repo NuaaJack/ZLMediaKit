@@ -23,6 +23,35 @@ using namespace toolkit;
 
 namespace mediakit {
 
+static bool endsWithIgnoreCase(const string &str, const string &suffix) {
+    if (str.size() < suffix.size()) {
+        return false;
+    }
+    return strcasecmp(str.data() + (str.size() - suffix.size()), suffix.data()) == 0;
+}
+
+static bool trimLiveStreamSuffix(string &url, const string &url_suffix) {
+    if (endsWithIgnoreCase(url, url_suffix)) {
+        url.resize(url.size() - url_suffix.size());
+        return true;
+    }
+
+    // 兼容旧地址：同时接受 *.live.flv 和 *.flv（ts/mp4同理）
+    static const string kLiveTag = ".live";
+    auto live_pos = url_suffix.find(kLiveTag);
+    if (live_pos == string::npos) {
+        return false;
+    }
+
+    auto legacy_suffix = url_suffix;
+    legacy_suffix.erase(live_pos, kLiveTag.size());
+    if (!endsWithIgnoreCase(url, legacy_suffix)) {
+        return false;
+    }
+    url.resize(url.size() - legacy_suffix.size());
+    return true;
+}
+
 HttpSession::HttpSession(const Socket::Ptr &pSock) : Session(pSock) {
     // 设置默认参数  [AUTO-TRANSLATED:ae5b72e6]
     // Set default parameters
@@ -281,15 +310,11 @@ bool HttpSession::checkLiveStream(const string &schema, const string &url_suffix
             return false;
         }
     } else {
-        auto prefix_size = url_suffix.size();
-        if (url.size() < prefix_size || strcasecmp(url.data() + (url.size() - prefix_size), url_suffix.data())) {
+        if (!trimLiveStreamSuffix(url, url_suffix)) {
             // 未找到后缀  [AUTO-TRANSLATED:6635499a]
             // Suffix not found
             return false;
         }
-        // url去除特殊后缀  [AUTO-TRANSLATED:31c0c080]
-        // Remove special suffix from url
-        url.resize(url.size() - prefix_size);
     }
 
     // 带参数的url  [AUTO-TRANSLATED:074764b0]
@@ -301,7 +326,10 @@ bool HttpSession::checkLiveStream(const string &schema, const string &url_suffix
 
     // 解析带上协议+参数完整的url  [AUTO-TRANSLATED:5cdc7e68]
     // Parse the complete url with protocol + parameters
-    _media_info.parse(schema + "://" + _parser["Host"] + url);
+    // 某些上层会把stream里“/”编码成%2F，这里做一次宽松解码，确保http/https/ws/wss地址都可回放
+    // Some callers encode "/" in stream id as %2F. Decode once here so http/https/ws/wss playback all resolve correctly.
+    auto normalized_url = strCoding::UrlDecodeComponent(url);
+    _media_info.parse(schema + "://" + _parser["Host"] + normalized_url);
 
     if (_media_info.app.empty() || _media_info.stream.empty()) {
         // url不合法  [AUTO-TRANSLATED:9aad134e]

@@ -64,6 +64,12 @@ private:
     std::shared_ptr<FILE> makeFile(const std::string &file,bool setbuf = false);
     void clearCache(bool immediately, bool eof);
     void saveCurrentDir();
+#if defined(ENABLE_S3_STORAGE)
+    bool storageEnabled() const;
+    std::string makeStorageObjectPrefix();
+    std::string formatSegmentDuration(uint64_t duration_ms) const;
+    void uploadCurrentSegmentToStorage(uint64_t duration_ms);
+#endif
 
 private:
     int _buf_size;
@@ -81,6 +87,10 @@ private:
     toolkit::EventPoller::Ptr _poller;
     std::map<uint64_t/*index*/,std::string/*file_path*/> _segment_file_paths;
     std::deque<std::tuple<int,std::string> > _current_dir_seg_list;
+#if defined(ENABLE_S3_STORAGE)
+    std::string _save_id;
+    std::string _curr_storage_object_prefix;
+#endif
 };
 
 }//namespace mediakit

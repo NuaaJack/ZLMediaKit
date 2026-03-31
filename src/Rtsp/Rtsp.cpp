@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <cinttypes>
+#include <algorithm>
 #include <random>
 #include "Rtsp.h"
 #include "Network/Socket.h"
@@ -377,13 +378,51 @@ template <int type>
 class PortManager : public std::enable_shared_from_this<PortManager<type>> {
 public:
     PortManager() {
-        static auto func = [](const string &str, int index) {
-            uint16_t port[] = { 30000, 35000 };
-            sscanf(str.data(), "%" SCNu16 "-%" SCNu16, port, port + 1);
-            return port[index];
+        static const string kDefaultRange = "30000-35000";
+        static auto parse_range = [](const string &str, uint16_t &min_port, uint16_t &max_port) {
+            uint16_t parsed[2] = {0, 0};
+            if (sscanf(str.data(), "%" SCNu16 "-%" SCNu16, parsed, parsed + 1) != 2) {
+                return false;
+            }
+            if (parsed[0] > parsed[1]) {
+                return false;
+            }
+            min_port = parsed[0];
+            max_port = parsed[1];
+            return true;
         };
-        GET_CONFIG_FUNC(uint16_t, s_min_port, RtpProxy::kPortRange, [](const string &str) { return func(str, 0); });
-        GET_CONFIG_FUNC(uint16_t, s_max_port, RtpProxy::kPortRange, [](const string &str) { return func(str, 1); });
+
+        GET_CONFIG(string, rtp_range, Rtp::kRtpPortRange);
+        GET_CONFIG(string, proxy_range, RtpProxy::kPortRange);
+
+        uint16_t rtp_min = 30000, rtp_max = 35000;
+        uint16_t proxy_min = 30000, proxy_max = 35000;
+        auto rtp_ok = parse_range(rtp_range, rtp_min, rtp_max);
+        auto proxy_ok = parse_range(proxy_range, proxy_min, proxy_max);
+
+        uint16_t s_min_port = 30000, s_max_port = 35000;
+        if (rtp_ok && proxy_ok) {
+            auto rtp_is_default = (rtp_range == kDefaultRange);
+            auto proxy_is_default = (proxy_range == kDefaultRange);
+            if (rtp_is_default && !proxy_is_default) {
+                s_min_port = proxy_min;
+                s_max_port = proxy_max;
+            } else if (!rtp_is_default && proxy_is_default) {
+                s_min_port = rtp_min;
+                s_max_port = rtp_max;
+            } else {
+                // 两个配置同时自定义时取交集，保证端口分配更安全可控
+                s_min_port = std::max(rtp_min, proxy_min);
+                s_max_port = std::min(rtp_max, proxy_max);
+            }
+        } else if (rtp_ok) {
+            s_min_port = rtp_min;
+            s_max_port = rtp_max;
+        } else if (proxy_ok) {
+            s_min_port = proxy_min;
+            s_max_port = proxy_max;
+        }
+
         assert(s_max_port >= s_min_port + 36 - 1);
         setRange((s_min_port + 1) / 2, s_max_port / 2);
     }

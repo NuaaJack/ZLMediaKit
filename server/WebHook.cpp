@@ -8,17 +8,36 @@
  * may be found in the AUTHORS file in the root of the source tree.
  */
 
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
+#include <json/writer.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
 #include "Util/logger.h"
 #include "Util/onceToken.h"
 #include "Util/NoticeCenter.h"
 #include "Common/config.h"
 #include "Common/MediaSource.h"
+#include "Common/MultiMediaSourceMuxer.h"
 #include "Http/HttpSession.h"
 #include "Http/HttpRequester.h"
 #include "Network/Session.h"
 #include "Rtsp/RtspSession.h"
 #include "Player/PlayerProxy.h"
+#include "Rtp/RtpProcess.h"
+#include "Network/sockutil.h"
+#include "System.h"
 #include "WebHook.h"
 #include "WebApi.h"
 
@@ -42,6 +61,7 @@ const string kOnFlowReport = HOOK_FIELD "on_flow_report";
 const string kOnRtspRealm = HOOK_FIELD "on_rtsp_realm";
 const string kOnRtspAuth = HOOK_FIELD "on_rtsp_auth";
 const string kOnStreamChanged = HOOK_FIELD "on_stream_changed";
+const string kHeartBeat = HOOK_FIELD "on_heart_beat";
 const string kStreamChangedSchemas = HOOK_FIELD "stream_changed_schemas";
 const string kOnStreamNotFound = HOOK_FIELD "on_stream_not_found";
 const string kOnRecordMp4 = HOOK_FIELD "on_record_mp4";
@@ -54,6 +74,7 @@ const string kOnServerExited = HOOK_FIELD "on_server_exited";
 const string kOnServerKeepalive = HOOK_FIELD "on_server_keepalive";
 const string kOnSendRtpStopped = HOOK_FIELD "on_send_rtp_stopped";
 const string kOnRtpServerTimeout = HOOK_FIELD "on_rtp_server_timeout";
+const string kReportStartTime = HOOK_FIELD "report_start_time";
 const string kAliveInterval = HOOK_FIELD "alive_interval";
 const string kRetry = HOOK_FIELD "retry";
 const string kRetryDelay = HOOK_FIELD "retry_delay";
@@ -69,6 +90,7 @@ static onceToken token([]() {
     mINI::Instance()[kOnRtspRealm] = "";
     mINI::Instance()[kOnRtspAuth] = "";
     mINI::Instance()[kOnStreamChanged] = "";
+    mINI::Instance()[kHeartBeat] = "";
     mINI::Instance()[kOnStreamNotFound] = "";
     mINI::Instance()[kOnRecordMp4] = "";
     mINI::Instance()[kOnRecordTs] = "";
@@ -80,10 +102,11 @@ static onceToken token([]() {
     mINI::Instance()[kOnServerKeepalive] = "";
     mINI::Instance()[kOnSendRtpStopped] = "";
     mINI::Instance()[kOnRtpServerTimeout] = "";
-    mINI::Instance()[kAliveInterval] = 30.0;
+    mINI::Instance()[kReportStartTime] = 30;
+    mINI::Instance()[kAliveInterval] = 10;
     mINI::Instance()[kRetry] = 1;
     mINI::Instance()[kRetryDelay] = 3.0;
-    mINI::Instance()[kStreamChangedSchemas] = "rtsp/rtmp/fmp4/ts/hls/hls.fmp4";
+    mINI::Instance()[kStreamChangedSchemas] = "rtsp/rtmp/fmp4/ts/hls/hls.fmp4/rtp";
 });
 } // namespace Hook
 
@@ -173,19 +196,331 @@ string getVhost(const HttpArgs &value) {
     return val != value.end() ? val->second : "";
 }
 
+void dumpMediaTuple(const MediaTuple &tuple, Json::Value &item);
+
 static atomic<uint64_t> s_hook_index { 0 };
+static Timer::Ptr g_keepalive_timer;
+static Timer::Ptr g_heartbeat_timer;
+static Timer::Ptr g_server_started_timer;
+static string s_ssl_file_name;
+
+static string generateRequestId() {
+    return StrPrinter << getCurrentMillisecond(true) << "-" << makeRandStr(12);
+}
+
+static int64_t parseInt64(const string &input, int64_t default_value = 0) {
+    if (input.empty()) {
+        return default_value;
+    }
+    char *end = nullptr;
+    auto val = std::strtoll(input.data(), &end, 10);
+    if (!end || *end != '\0') {
+        return default_value;
+    }
+    return val;
+}
+
+static uint16_t getPortFromConfig(const char *key) {
+    auto it = mINI::Instance().find(key);
+    if (it == mINI::Instance().end()) {
+        return 0;
+    }
+    return static_cast<uint16_t>(mINI::Instance()[key]);
+}
+
+static int getCpuCoreCount() {
+    string output = System::execute("nproc 2>/dev/null");
+    trim(output);
+    auto val = static_cast<int>(parseInt64(output, 0));
+    return std::max(val, 1);
+}
+
+static int64_t getMemTotalKb() {
+    string output = System::execute("awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null");
+    trim(output);
+    return parseInt64(output, 0);
+}
+
+static int64_t getMemAvailableKb() {
+    string output = System::execute("awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null");
+    trim(output);
+    return parseInt64(output, 0);
+}
+
+struct CpuSample {
+    uint64_t total = 0;
+    uint64_t idle = 0;
+    bool valid = false;
+};
+
+static CpuSample readCpuSample() {
+    std::ifstream ifs("/proc/stat");
+    string line;
+    if (!ifs.is_open() || !std::getline(ifs, line)) {
+        return {};
+    }
+
+    std::istringstream ss(line);
+    string cpu;
+    uint64_t user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0, guest = 0, guest_nice = 0;
+    ss >> cpu >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal >> guest >> guest_nice;
+    if (cpu != "cpu") {
+        return {};
+    }
+
+    CpuSample sample;
+    sample.idle = idle + iowait;
+    sample.total = user + nice + system + idle + iowait + irq + softirq + steal + guest + guest_nice;
+    sample.valid = sample.total > 0;
+    return sample;
+}
+
+static double getCpuUsagePercent() {
+    static std::mutex mtx;
+    static CpuSample prev;
+    std::lock_guard<std::mutex> lck(mtx);
+
+    auto current = readCpuSample();
+    if (!current.valid) {
+        return 0.0;
+    }
+    if (!prev.valid) {
+        prev = current;
+        return 0.0;
+    }
+
+    auto total_delta = current.total - prev.total;
+    auto idle_delta = current.idle - prev.idle;
+    prev = current;
+    if (total_delta == 0) {
+        return 0.0;
+    }
+    return (double)(total_delta - idle_delta) * 100.0 / total_delta;
+}
+
+static string getReportIp() {
+    GET_CONFIG(string, server_ip, General::kMediaServerIp);
+    if (!server_ip.empty() && server_ip != "127.0.0.1" && server_ip != "0.0.0.0") {
+        return server_ip;
+    }
+    auto local_ip = SockUtil::get_local_ip();
+    return local_ip.empty() ? server_ip : local_ip;
+}
+
+static int safeGetReaderCount(const MediaSource::Ptr &media) {
+    try {
+        return media->readerCount();
+    } catch (const std::exception &ex) {
+        WarnL << "readerCount failed for " << media->getUrl() << ", ex: " << ex.what();
+    } catch (...) {
+        WarnL << "readerCount failed for " << media->getUrl() << ", ex: unknown";
+    }
+    return 0;
+}
+
+static int safeGetTotalReaderCount(const MediaSource::Ptr &media) {
+    try {
+        return media->totalReaderCount();
+    } catch (const std::exception &ex) {
+        WarnL << "totalReaderCount fallback for " << media->getUrl() << ", ex: " << ex.what();
+    } catch (...) {
+        WarnL << "totalReaderCount fallback for " << media->getUrl() << ", ex: unknown";
+    }
+    return safeGetReaderCount(media);
+}
+
+static Value buildLiveStreamJson() {
+    Value streams(arrayValue);
+    MediaSource::for_each_media([&](const MediaSource::Ptr &media) {
+        const auto &schema = media->getSchema();
+        // Heartbeat stream list only keeps rtmp/rtsp/ts to match dispatch expectations.
+        if (schema != "rtmp" && schema != "rtsp" && schema != "ts") {
+            return;
+        }
+        Value item(objectValue);
+        const auto &tuple = media->getMediaTuple();
+        item["schema"] = schema;
+        item["app"] = tuple.app;
+        item["stream"] = tuple.stream;
+        item["readerCount"] = safeGetReaderCount(media);
+        item["totalReaderCount"] = safeGetTotalReaderCount(media);
+        streams.append(item);
+    });
+    return streams;
+}
+
+struct RuntimeStat {
+    uint64_t reader_count = 0;
+    uint64_t processing_count = 0;
+    uint64_t uplink_bytes_speed = 0;
+    uint64_t downlink_bytes_speed = 0;
+};
+
+static RuntimeStat collectRuntimeStat() {
+    struct AggregatedStreamStat {
+        uint64_t bytes_speed = 0;
+        uint64_t total_bytes = 0;
+        uint64_t reader_count = 0;
+    };
+
+    RuntimeStat stat;
+    static std::unordered_map<string, uint64_t> s_prev_total_bytes;
+    static uint64_t s_prev_ts_ms = 0;
+
+    std::unordered_map<string, AggregatedStreamStat> stream_stats;
+    auto now_ts_ms = getCurrentMillisecond(true);
+    auto elapsed_sec = s_prev_ts_ms > 0 ? (double)(now_ts_ms - s_prev_ts_ms) / 1000.0 : 0.0;
+    if (elapsed_sec < 0) {
+        elapsed_sec = 0.0;
+    }
+
+    auto muxer_input_bytes = MultiMediaSourceMuxer::getAndResetGlobalInBytes();
+
+    MediaSource::for_each_media([&](const MediaSource::Ptr &media) {
+        const auto &tuple = media->getMediaTuple();
+        auto &agg = stream_stats[tuple.shortUrl()];
+        agg.bytes_speed = std::max<uint64_t>(agg.bytes_speed, static_cast<uint64_t>(media->getBytesSpeed()));
+        agg.total_bytes = std::max<uint64_t>(agg.total_bytes, static_cast<uint64_t>(media->getTotalBytes()));
+        auto reader_count = safeGetTotalReaderCount(media);
+        if (reader_count > 0) {
+            agg.reader_count = std::max<uint64_t>(agg.reader_count, static_cast<uint64_t>(reader_count));
+        }
+    });
+
+    stat.processing_count = stream_stats.size();
+
+    for (const auto &it : stream_stats) {
+        const auto &stream_id = it.first;
+        const auto &agg = it.second;
+        auto speed = agg.bytes_speed;
+        if (speed == 0 && elapsed_sec > 0.001) {
+            auto prev_it = s_prev_total_bytes.find(stream_id);
+            if (prev_it != s_prev_total_bytes.end() && agg.total_bytes >= prev_it->second) {
+                auto delta_bytes = agg.total_bytes - prev_it->second;
+                speed = (uint64_t)std::llround((double)delta_bytes / elapsed_sec);
+            }
+        }
+        stat.reader_count += agg.reader_count;
+        stat.uplink_bytes_speed += speed;
+        stat.downlink_bytes_speed += speed * agg.reader_count;
+    }
+
+    if (elapsed_sec > 0.001 && muxer_input_bytes > 0) {
+        auto muxer_uplink_speed = (uint64_t)std::llround((double)muxer_input_bytes / elapsed_sec);
+        stat.uplink_bytes_speed = std::max<uint64_t>(stat.uplink_bytes_speed, muxer_uplink_speed);
+    }
+
+    s_prev_total_bytes.clear();
+    for (const auto &it : stream_stats) {
+        s_prev_total_bytes.emplace(it.first, it.second.total_bytes);
+    }
+    s_prev_ts_ms = now_ts_ms;
+
+    return stat;
+}
+
+static double bytesPerSecToMb(uint64_t bytes_per_sec) {
+    return (double)bytes_per_sec * 8.0 / 1000000.0;
+}
+
+static double roundTo3(double value) {
+    return std::round(value * 1000.0) / 1000.0;
+}
+
+static string toJsonStringWithPrecision(const Value &val, unsigned int precision, bool pretty) {
+    Json::StreamWriterBuilder builder;
+    builder["commentStyle"] = "None";
+    builder["indentation"] = pretty ? "\t" : "";
+    builder["precision"] = precision;
+    builder["precisionType"] = "decimal";
+    builder["emitUTF8"] = true;
+    return Json::writeString(builder, val);
+}
+
+static int parseRegisterResult(const Value &obj) {
+    if (obj.isObject() && obj["result"].isBool()) {
+        return obj["result"].asBool() ? 1 : 0;
+    }
+    if (obj.isObject() && obj["result"].isNumeric()) {
+        return obj["result"].asInt();
+    }
+    if (obj.isObject() && obj["code"].isNumeric()) {
+        return obj["code"].asInt() == 0 ? 1 : 0;
+    }
+    return -1;
+}
+
+static int parseIntervalSec(const std::string &raw, int default_value) {
+    auto fallback = std::max(default_value, 1);
+    if (raw.empty()) {
+        return fallback;
+    }
+    char *end = nullptr;
+    auto value = std::strtod(raw.c_str(), &end);
+    if (end == raw.c_str() || !std::isfinite(value) || value <= 0) {
+        return fallback;
+    }
+    return std::max(1, (int)std::llround(value));
+}
+
+static bool endsWithIgnoreCase(const std::string &str, const std::string &suffix) {
+    if (str.size() < suffix.size()) {
+        return false;
+    }
+    auto offset = str.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        auto lhs = (char)std::tolower((unsigned char)str[offset + i]);
+        auto rhs = (char)std::tolower((unsigned char)suffix[i]);
+        if (lhs != rhs) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void set_ssl_file_name(const std::string &ssl_file_name) {
+    if (ssl_file_name.empty()) {
+        return;
+    }
+    auto basename = ssl_file_name;
+    auto pos = basename.find_last_of("/\\");
+    if (pos != std::string::npos) {
+        basename = basename.substr(pos + 1);
+    }
+    if (basename.empty()) {
+        return;
+    }
+
+    static const std::array<std::string, 6> kCertExt = { ".pem", ".p12", ".pfx", ".crt", ".cer", ".key" };
+    for (const auto &ext : kCertExt) {
+        if (endsWithIgnoreCase(basename, ext)) {
+            basename.resize(basename.size() - ext.size());
+            break;
+        }
+    }
+    if (basename.empty()) {
+        return;
+    }
+    s_ssl_file_name = basename;
+    InfoL << "set_ssl_file_name SSL file name:" << s_ssl_file_name;
+}
 
 void do_http_hook(const string &url, const ArgsType &body, const function<void(const Value &, const string &)> &func, uint32_t retry) {
     GET_CONFIG(string, mediaServerId, General::kMediaServerId);
     GET_CONFIG(float, hook_timeoutSec, Hook::kTimeoutSec);
     GET_CONFIG(float, retry_delay, Hook::kRetryDelay);
 
-    const_cast<ArgsType &>(body)["mediaServerId"] = mediaServerId;
+    auto media_server_id = parseInt64(mediaServerId, 0);
+    if (media_server_id > 0) {
+        const_cast<ArgsType &>(body)["mediaServerId"] = media_server_id;
+    } else {
+        const_cast<ArgsType &>(body)["mediaServerId"] = mediaServerId;
+    }
     const_cast<ArgsType &>(body)["hook_index"] = (Json::UInt64)(s_hook_index++);
 
     auto requester = std::make_shared<HttpRequester>();
     requester->setMethod("POST");
-    auto bodyStr = to_string(body);
+    auto bodyStr = toJsonStringWithPrecision(body, 3, false);
     requester->setBody(bodyStr);
     requester->addHeader("Content-Type", getContentType(body));
     auto vhost = getVhost(body);
@@ -229,8 +564,6 @@ void do_http_hook(const string &url, const ArgsType &body, const function<void(c
     do_http_hook(url, body, func, hook_retry);
 }
 
-void dumpMediaTuple(const MediaTuple &tuple, Json::Value& item);
-
 ArgsType make_json(const MediaInfo &args) {
     ArgsType body;
     body["schema"] = args.schema;
@@ -242,22 +575,6 @@ ArgsType make_json(const MediaInfo &args) {
     dumpMediaTuple(args, body);
     body["params"] = args.params;
     return body;
-}
-
-static void reportServerStarted() {
-    GET_CONFIG(bool, hook_enable, Hook::kEnable);
-    GET_CONFIG(string, hook_server_started, Hook::kOnServerStarted);
-    if (!hook_enable || hook_server_started.empty()) {
-        return;
-    }
-
-    ArgsType body;
-    for (auto &pr : mINI::Instance()) {
-        body[pr.first] = (string &)pr.second;
-    }
-    // 执行hook  [AUTO-TRANSLATED:1df68201]
-    // Execute hook
-    do_http_hook(hook_server_started, body, nullptr);
 }
 
 static void reportServerExited() {
@@ -273,9 +590,98 @@ static void reportServerExited() {
     do_http_hook(hook_server_exited, body, nullptr);
 }
 
-// 服务器定时保活定时器  [AUTO-TRANSLATED:2bb39e50]
-// Server keep-alive timer
-static Timer::Ptr g_keepalive_timer;
+static void reportServerStarted() {
+    GET_CONFIG(bool, hook_enable, Hook::kEnable);
+    GET_CONFIG(string, hook_server_started, Hook::kOnServerStarted);
+    if (!hook_enable || hook_server_started.empty()) {
+        return;
+    }
+
+    GET_CONFIG(string, media_server_id, General::kMediaServerId);
+    GET_CONFIG(string, pem_file_name, General::kMediaServerPemFile);
+    GET_CONFIG(string, pem_replace_ip, General::kMediaServerPemIp);
+    GET_CONFIG(bool, enable_pem, General::kEnablePem);
+    GET_CONFIG(int, support_stream_count, General::kSupportStreamCount);
+
+    auto server_ip = getReportIp();
+    auto report_pem_name = s_ssl_file_name.empty() ? pem_file_name : s_ssl_file_name;
+    InfoL << "Report SSL file name:" << report_pem_name;
+    InfoL << "Report Server Ip: \"" << server_ip << "\"";
+    InfoL << "Get Support Max Stream Count:" << support_stream_count;
+
+    auto server_ports = get_server_ports();
+    auto get_port = [&](const std::string &name, const char *fallback_key) -> uint16_t {
+        auto it = server_ports.find(name);
+        if (it != server_ports.end()) {
+            return it->second;
+        }
+        return getPortFromConfig(fallback_key);
+    };
+
+    ArgsType port_info;
+    port_info["shellPort"] = get_port("shellPort", "shell.port");
+    port_info["rtspPort"] = get_port("rtspPort", "rtsp.port");
+    port_info["rtspsPort"] = get_port("rtspsPort", "rtsp.sslport");
+    port_info["rtmpPort"] = get_port("rtmpPort", "rtmp.port");
+    port_info["rtmpsPort"] = get_port("rtmpsPort", "rtmp.sslport");
+    port_info["httpPort"] = get_port("httpPort", "http.port");
+    port_info["httpsPort"] = get_port("httpsPort", "http.sslport");
+    port_info["rtpProxyPort"] = get_port("rtpProxyPort", "rtp_proxy.port");
+    port_info["rtcPort"] = get_port("rtcPort", "rtc.port");
+    port_info["srtPort"] = get_port("srtPort", "srt.port");
+
+    ArgsType body;
+    body["requestId"] = generateRequestId();
+    body["portInfo"] = port_info;
+    body["cpu"] = getCpuCoreCount();
+    // Keep old ja-media-fs payload shape: memory is reported as a string (KB).
+    body["memory"] = std::to_string(getMemTotalKb());
+    body["uplinkBandWidth"] = 0;
+    body["downlinkBandWidth"] = 0;
+    auto report_host = enable_pem ? report_pem_name : pem_replace_ip;
+    if (report_host.empty()) {
+        report_host = server_ip;
+    }
+    body["host"] = report_host;
+    body["ip"] = server_ip;
+    body["port"] = port_info["httpPort"];
+    auto id_num = parseInt64(media_server_id, 0);
+    if (id_num > 0) {
+        body["id"] = id_num;
+    } else {
+        body["id"] = media_server_id;
+    }
+    body["processTotal"] = support_stream_count;
+
+    // 执行hook  [AUTO-TRANSLATED:1df68201]
+    // Execute hook
+    do_http_hook(hook_server_started, body, [](const Value &obj, const string &err) {
+        if (!err.empty()) {
+            WarnL << "Regist Result:0, err:" << err;
+            return;
+        }
+        auto regist_result = parseRegisterResult(obj);
+        InfoL << "Regist Result:" << regist_result;
+        if (regist_result == 1) {
+            InfoL << "Regist to Dispatch Success!!";
+        }
+    });
+}
+
+static void reportServerStartedPeriodically() {
+    GET_CONFIG(bool, hook_enable, Hook::kEnable);
+    GET_CONFIG(string, hook_server_started, Hook::kOnServerStarted);
+    GET_CONFIG(string, report_start_time_raw, Hook::kReportStartTime);
+    if (!hook_enable || hook_server_started.empty()) {
+        return;
+    }
+    auto report_start_interval_sec = parseIntervalSec(report_start_time_raw, 30);
+    g_server_started_timer = std::make_shared<Timer>((float)report_start_interval_sec, []() {
+        reportServerStarted();
+        return true;
+    }, nullptr);
+}
+
 static void reportServerKeepalive() {
     GET_CONFIG(bool, hook_enable, Hook::kEnable);
     GET_CONFIG(string, hook_server_keepalive, Hook::kOnServerKeepalive);
@@ -283,14 +689,69 @@ static void reportServerKeepalive() {
         return;
     }
 
-    GET_CONFIG(float, alive_interval, Hook::kAliveInterval);
-    g_keepalive_timer = std::make_shared<Timer>(alive_interval,[]() {
+    GET_CONFIG(string, alive_interval_raw, Hook::kAliveInterval);
+    auto alive_interval = parseIntervalSec(alive_interval_raw, 10);
+    g_keepalive_timer = std::make_shared<Timer>((float)alive_interval,[]() {
         getStatisticJson([](const Value &data) mutable {
             ArgsType body;
+            body["requestId"] = generateRequestId();
             body["data"] = data;
+            body["streams"] = buildLiveStreamJson();
             // 执行hook  [AUTO-TRANSLATED:1df68201]
             // Execute hook
             do_http_hook(hook_server_keepalive, body, nullptr);
+        });
+        return true;
+    }, nullptr);
+}
+
+static void reportHeartBeat() {
+    GET_CONFIG(bool, hook_enable, Hook::kEnable);
+    GET_CONFIG(string, hook_heart_beat, Hook::kHeartBeat);
+    if (!hook_enable || hook_heart_beat.empty()) {
+        return;
+    }
+
+    GET_CONFIG(string, alive_interval_raw, Hook::kAliveInterval);
+    GET_CONFIG(int, max_hard_decoder_count, General::kMaxHardDecoderCount);
+    GET_CONFIG(string, media_server_id, General::kMediaServerId);
+    auto alive_interval = parseIntervalSec(alive_interval_raw, 10);
+
+    g_heartbeat_timer = std::make_shared<Timer>((float)alive_interval, []() {
+        auto body = std::make_shared<ArgsType>();
+        auto request_id = generateRequestId();
+        (*body)["requestId"] = request_id;
+        auto id_num = parseInt64(media_server_id, 0);
+        if (id_num > 0) {
+            (*body)["id"] = id_num;
+        } else {
+            (*body)["id"] = media_server_id;
+        }
+        // Keep semantics close to ja-media-fs: report system-level load snapshot.
+        auto cpu_idle = (int)std::lround(getCpuUsagePercent());
+        cpu_idle = std::max(0, std::min(100, cpu_idle));
+        (*body)["cpuIdle"] = cpu_idle;
+        auto memory_free_mb = std::max<int64_t>(0, getMemAvailableKb() / 1024);
+        (*body)["memoryFree"] = (Json::UInt64)memory_free_mb;
+
+        auto stat = collectRuntimeStat();
+        auto uplink_bandwidth_mb = roundTo3(bytesPerSecToMb(stat.uplink_bytes_speed));
+        auto downlink_bandwidth_mb = stat.reader_count > 0 ? roundTo3(bytesPerSecToMb(stat.downlink_bytes_speed)) : 0.0;
+        (*body)["uplinkBandWidth"] = uplink_bandwidth_mb;
+        (*body)["downlinkBandWidth"] = downlink_bandwidth_mb;
+        (*body)["readerCount"] = (Json::UInt64)stat.reader_count;
+        (*body)["proccessingCount"] = (Json::UInt64)stat.processing_count;
+        (*body)["transcodeCount"] = 0;
+        (*body)["maxTranscodeCount"] = max_hard_decoder_count;
+
+        // Merge keepalive payload into heartbeat to avoid two periodic hook channels.
+        getStatisticJson([body, request_id](const Value &data) mutable {
+            (*body)["data"] = data;
+            (*body)["streams"] = buildLiveStreamJson();
+
+            InfoL << "on_heart_beat body: " << toJsonStringWithPrecision(*body, 3, true);
+
+            do_http_hook(hook_heart_beat, *body, nullptr);
         });
         return true;
     }, nullptr);
@@ -558,6 +1019,15 @@ void installWebHook() {
             body["schema"] = sender.getSchema();
             dumpMediaTuple(sender.getMediaTuple(), body);
             body["regist"] = bRegist;
+        }
+        body["requestId"] = generateRequestId();
+        if (sender.getSchema() == "rtp") {
+            auto process = sender.getRtpProcess();
+            if (process) {
+                body["rtp_local_port"] = process->get_local_port();
+                body["rtp_peer_ip"] = process->get_peer_ip();
+                body["rtp_peer_port"] = process->get_peer_port();
+            }
         }
         // 执行hook  [AUTO-TRANSLATED:1df68201]
         // Execute hook
@@ -864,13 +1334,15 @@ void installWebHook() {
     // 汇报服务器重新启动  [AUTO-TRANSLATED:bd7d83df]
     // Report server restart
     reportServerStarted();
+    reportServerStartedPeriodically();
 
-    // 定时上报保活  [AUTO-TRANSLATED:bd2364a0]
-    // Report keep-alive regularly
-    reportServerKeepalive();
+    // keepalive payload is merged into heartbeat; only heartbeat is scheduled.
+    reportHeartBeat();
 }
 
 void unInstallWebHook() {
+    g_server_started_timer.reset();
+    g_heartbeat_timer.reset();
     g_keepalive_timer.reset();
     NoticeCenter::Instance().delListener(&web_hook_tag);
 }

@@ -10,6 +10,7 @@
 
 #include <signal.h>
 #include <iostream>
+#include <map>
 #include "Util/File.h"
 #include "Util/logger.h"
 #include "Util/SSLBox.h"
@@ -247,8 +248,15 @@ int start_main(int argc,char *argv[]) {
         logLevel = MIN(MAX(logLevel, LTrace), LError);
         g_ini_file = cmd_main["config"];
         string ssl_file = cmd_main["ssl"];
+        string default_ssl_file = exeDir() + "default.pem";
         int threads = cmd_main["threads"];
         bool affinity = cmd_main["affinity"];
+
+        // `-s` 支持传证书路径(例如 config/video.jing-an.com.pem)，
+        // 这里提取文件名用于 on_server_started 的 host 上报。
+        if (ssl_file != default_ssl_file) {
+            set_ssl_file_name(ssl_file);
+        }
 
         // 设置日志  [AUTO-TRANSLATED:50372045]
         // Set log
@@ -417,8 +425,6 @@ int start_main(int argc,char *argv[]) {
 
         installWebApi();
         InfoL << "已启动http api 接口";
-        installWebHook();
-        InfoL << "已启动http hook 接口";
 
         try {
             // rtsp服务器，端口默认554  [AUTO-TRANSLATED:07937d81]
@@ -472,6 +478,34 @@ int start_main(int argc,char *argv[]) {
             // srt udp server
             if (srtPort) { srtSrv->start<SRT::SrtSession>(srtPort, listen_ip); }
 #endif//defined(ENABLE_SRT)
+
+            // 记录实际监听端口，用于hook上报
+            std::map<std::string, uint16_t> server_ports;
+            server_ports.insert(std::make_pair("shellPort", shellSrv->getPort()));
+            server_ports.insert(std::make_pair("rtspPort", rtspSrv->getPort()));
+            server_ports.insert(std::make_pair("rtspsPort", rtspSSLSrv->getPort()));
+            server_ports.insert(std::make_pair("rtmpPort", rtmpSrv->getPort()));
+            server_ports.insert(std::make_pair("rtmpsPort", rtmpsSrv->getPort()));
+            server_ports.insert(std::make_pair("httpPort", httpSrv->getPort()));
+            server_ports.insert(std::make_pair("httpsPort", httpsSrv->getPort()));
+#if defined(ENABLE_RTPPROXY)
+            server_ports.insert(std::make_pair("rtpProxyPort", rtpServer->getPort()));
+#else
+            server_ports.insert(std::make_pair("rtpProxyPort", 0));
+#endif
+#if defined(ENABLE_WEBRTC)
+            server_ports.insert(std::make_pair("rtcPort", rtcSrv_udp->getPort()));
+#else
+            server_ports.insert(std::make_pair("rtcPort", 0));
+#endif
+#if defined(ENABLE_SRT)
+            server_ports.insert(std::make_pair("srtPort", srtSrv->getPort()));
+#else
+            server_ports.insert(std::make_pair("srtPort", 0));
+#endif
+            flush_server_ports(server_ports);
+            installWebHook();
+            InfoL << "已启动http hook 接口";
 
         } catch (std::exception &ex) {
             ErrorL << "Start server failed: " << ex.what();
@@ -539,5 +573,3 @@ int main(int argc,char *argv[]) {
     return start_main(argc,argv);
 }
 #endif //DISABLE_MAIN
-
-

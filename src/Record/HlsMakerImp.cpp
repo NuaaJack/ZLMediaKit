@@ -9,18 +9,27 @@
  */
 
 #include <ctime>
+#include <chrono>
 #include <iomanip> 
+#include <sstream>
+#include <vector>
 #include <sys/stat.h>
 #include "HlsMakerImp.h"
 #include "Util/util.h"
 #include "Util/uv_errno.h"
 #include "Util/File.h"
 #include "Common/config.h"
+#if defined(ENABLE_S3_STORAGE)
+#include "S3/S3Storage.h"
+#endif
 
 using namespace std;
 using namespace toolkit;
 
 namespace mediakit {
+#if defined(ENABLE_S3_STORAGE)
+static S3Storage &s_s3_storage = S3Storage::getInstance();
+#endif
 
 std::string getDelayPath(const std::string& originalPath) {
     std::size_t pos = originalPath.find(".m3u8");
@@ -173,6 +182,13 @@ string HlsMakerImp::onOpenSegment(uint64_t index) {
     _info.file_name = segment_name;
     _info.file_path = segment_path;
     _info.url = _info.app + "/" + _info.stream + "/" + segment_name;
+#if defined(ENABLE_S3_STORAGE)
+    if (!isFmp4() && storageEnabled()) {
+        _curr_storage_object_prefix = makeStorageObjectPrefix();
+    } else {
+        _curr_storage_object_prefix.clear();
+    }
+#endif
 
     if (!_file) {
         WarnL << "Create file failed," << segment_path << " " << get_uv_errmsg();
@@ -233,6 +249,11 @@ void HlsMakerImp::onFlushLastSegment(uint64_t duration_ms) {
     // 关闭并flush文件到磁盘  [AUTO-TRANSLATED:9798ec4d]
     // Close and flush file to disk
     _file = nullptr;
+#if defined(ENABLE_S3_STORAGE)
+    if (!isFmp4()) {
+        uploadCurrentSegmentToStorage(duration_ms);
+    }
+#endif
     if (!isLive() || isKeep()) {
         _current_dir_seg_list.emplace_back(duration_ms, _info.file_name.erase(0, _current_dir.size()));
     }
@@ -265,5 +286,56 @@ void HlsMakerImp::setMediaSource(const MediaTuple& tuple) {
 HlsMediaSource::Ptr HlsMakerImp::getMediaSource() const {
     return _media_src;
 }
+
+#if defined(ENABLE_S3_STORAGE)
+bool HlsMakerImp::storageEnabled() const {
+    GET_CONFIG(bool, s3_enable, MediaStorage::kEnable);
+    return s3_enable;
+}
+
+std::string HlsMakerImp::formatSegmentDuration(uint64_t duration_ms) const {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(6) << (duration_ms / 1000.0);
+    return os.str();
+}
+
+std::string HlsMakerImp::makeStorageObjectPrefix() {
+    auto str_date = getTimeStr("%Y/%m/%d");
+    auto str_hour = getTimeStr("%H");
+    auto str_minute = getTimeStr("%M");
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    auto now_ms_str = std::to_string(now_ms);
+    if (_save_id.empty()) {
+        _save_id = now_ms_str.size() > 4 ? now_ms_str.substr(0, now_ms_str.size() - 4) : now_ms_str;
+    }
+    auto channel_vec = split(_info.stream, "/");
+    auto stream_name = _info.stream;
+    if (!channel_vec.empty()) {
+        stream_name = channel_vec.size() > 1 ? channel_vec[1] : channel_vec[0];
+    }
+    return StrPrinter << "vod/" << stream_name << "/" << str_date << "/" << str_hour << "/" << str_minute << "/"
+                      << _save_id << "-" << now_ms_str;
+}
+
+void HlsMakerImp::uploadCurrentSegmentToStorage(uint64_t duration_ms) {
+    if (!storageEnabled()) {
+        return;
+    }
+    if (_curr_storage_object_prefix.empty() || _info.file_path.empty()) {
+        return;
+    }
+
+    auto seg_content = File::loadFile(_info.file_path);
+    if (seg_content.empty()) {
+        WarnL << "TS segment empty or read failed, skip S3 upload: " << _info.file_path;
+        return;
+    }
+
+    std::vector<char> payload(seg_content.begin(), seg_content.end());
+    std::string bucket_name = "ja-media-fs";
+    std::string object_name = _curr_storage_object_prefix + "-" + formatSegmentDuration(duration_ms) + ".ts";
+    s_s3_storage.put_object(_info.stream, bucket_name, object_name, payload);
+}
+#endif
 
 } // namespace mediakit

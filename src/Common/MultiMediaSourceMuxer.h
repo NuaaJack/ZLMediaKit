@@ -11,6 +11,7 @@
 #ifndef ZLMEDIAKIT_MULTIMEDIASOURCEMUXER_H
 #define ZLMEDIAKIT_MULTIMEDIASOURCEMUXER_H
 
+#include <atomic>
 #include "Common/Stamp.h"
 #include "Common/MediaSource.h"
 #include "Common/MediaSink.h"
@@ -25,6 +26,8 @@
 
 namespace mediakit {
 
+class MultiLinkControl;
+
 class MultiMediaSourceMuxer : public MediaSourceEventInterceptor, public MediaSink, public toolkit::noncopyable, public std::enable_shared_from_this<MultiMediaSourceMuxer>{
 public:
     using Ptr = std::shared_ptr<MultiMediaSourceMuxer>;
@@ -38,6 +41,7 @@ public:
     };
 
     MultiMediaSourceMuxer(const MediaTuple& tuple, float dur_sec = 0.0,const ProtocolOption &option = ProtocolOption());
+    ~MultiMediaSourceMuxer() override;
 
     /**
      * 设置事件监听器
@@ -66,6 +70,12 @@ public:
      * [AUTO-TRANSLATED:5eaac131]
      */
     int totalReaderCount() const;
+
+    /**
+     * 获取并重置所有 muxer 在统计周期内累计的输入字节数
+     * Get and reset total input bytes accumulated by all muxers in the current statistic window.
+     */
+    static uint64_t getAndResetGlobalInBytes();
 
     /**
      * 判断是否生效(是否正在转其他协议)
@@ -223,6 +233,7 @@ protected:
     bool onTrackFrame_l(const Frame::Ptr &frame);
 
 private:
+    void unregisterAcsMuxer();
     void createGopCacheIfNeed(size_t gop_count);
     std::shared_ptr<MediaSinkInterface> makeRecorder(Recorder::type type);
 
@@ -230,8 +241,12 @@ private:
     bool _is_enable = false;
     bool _create_in_poller = false;
     bool _video_key_pos = false;
+    bool _is_acs_sub_stream = false;
+    int _acs_priority = 0;
+    std::atomic<bool> _acs_registered { false };
     float _dur_sec;
     std::shared_ptr<class FramePacedSender> _paced_sender;
+    std::string _real_stream_id;
     MediaTuple _tuple;
     ProtocolOption _option;
     toolkit::Ticker _last_check;

@@ -16,6 +16,8 @@
 #include "Util/onceToken.h"
 #include "macros.h"
 #include <functional>
+#include <map>
+#include <string>
 
 namespace mediakit {
 
@@ -32,6 +34,10 @@ class ProtocolOption;
 // 加载配置文件成功后返回true，否则返回false  [AUTO-TRANSLATED:cba43e43]
 // Returns true if the configuration file is loaded successfully, otherwise returns false.
 bool loadIniConfig(const char *ini_path = nullptr);
+
+// 更新/获取服务当前实际监听端口，用于hook上报
+void flush_server_ports(const std::map<std::string, uint16_t> &server_ports);
+std::map<std::string, uint16_t> get_server_ports();
 
 // //////////广播名称///////////  [AUTO-TRANSLATED:439b2d74]
 // //////////Broadcast Name///////////
@@ -211,9 +217,19 @@ extern const std::string kBroadcastCreateMuxer;
 // //////////通用配置///////////  [AUTO-TRANSLATED:b09b9640]
 // //////////General Configuration///////////
 namespace General {
+// 内部流媒体服务器Id，用于监控
+extern const std::string kInternalServerId;
 // 每个流媒体服务器的ID（GUID）  [AUTO-TRANSLATED:c6ac6e56]
 // ID (GUID) of each media server
 extern const std::string kMediaServerId;
+// 流媒体服务IP，用于业务上报
+extern const std::string kMediaServerIp;
+// 是否上报证书域名信息
+extern const std::string kEnablePem;
+// 证书文件路径
+extern const std::string kMediaServerPemFile;
+// 证书对应IP
+extern const std::string kMediaServerPemIp;
 // 流量汇报事件流量阈值,单位KB，默认1MB  [AUTO-TRANSLATED:fd036326]
 // Traffic reporting event traffic threshold, unit KB, default 1MB
 extern const std::string kFlowThreshold;
@@ -242,6 +258,17 @@ extern const std::string kResetWhenRePlay;
 // 开启后会同时关闭TCP_NODELAY并开启MSG_MORE  [AUTO-TRANSLATED:953b82cf]
 // When enabled, TCP_NODELAY will be closed and MSG_MORE will be enabled at the same time
 extern const std::string kMergeWriteMS;
+// 历史业务兼容：使用general命名空间的协议转换配置
+extern const std::string kAddMuteAudio;
+extern const std::string kPublishToHls;
+extern const std::string kPublishToMP4;
+extern const std::string kModifyStamp;
+extern const std::string kHlsDemand;
+extern const std::string kRtspDemand;
+extern const std::string kRtmpDemand;
+extern const std::string kTSDemand;
+extern const std::string kFMP4Demand;
+extern const std::string kEnableAudio;
 // 在docker环境下，不能通过英伟达驱动是否存在来判断是否支持硬件转码  [AUTO-TRANSLATED:de678431]
 // In the docker environment, the existence of the NVIDIA driver cannot be used to determine whether hardware transcoding is supported
 extern const std::string kCheckNvidiaDev;
@@ -262,6 +289,22 @@ extern const std::string kWaitAddTrackMS;
 // 如果track未就绪，我们先缓存帧数据，但是有最大个数限制(100帧时大约4秒)，防止内存溢出  [AUTO-TRANSLATED:c520054f]
 // If the track is not ready, we will cache the frame data first, but there is a maximum number limit (100 frames is about 4 seconds) to prevent memory overflow
 extern const std::string kUnreadyFrameCache;
+// 是否在每帧插入时间戳SEI
+extern const std::string kInsertTimestampSei;
+// Prometheus端口
+extern const std::string kPrometheusPort;
+// 启动上报周期
+extern const std::string kReportStartTime;
+// 是否动态查找端口
+extern const std::string kEnableDynamicPort;
+// 上报支持流数量
+extern const std::string kSupportStreamCount;
+// 支持的最大硬解码数量
+extern const std::string kMaxHardDecoderCount;
+// 初始硬解码数量
+extern const std::string kInitHardDecoderCount;
+// FLV SPS重写开关
+extern const std::string kReWriteFlvSPS;
 // 是否启用观看人数变化事件广播，置1则启用，置0则关闭  [AUTO-TRANSLATED:3b7f0748]
 // Whether to enable viewer count change event broadcast, set to 1 to enable, set to 0 to disable
 extern const std::string kBroadcastPlayerCountChanged;
@@ -269,6 +312,20 @@ extern const std::string kBroadcastPlayerCountChanged;
 // Bound local network card ip
 extern const std::string kListenIP;
 } // namespace General
+
+namespace Redis {
+extern const std::string kRedisHost;
+extern const std::string kRedisPort;
+extern const std::string kRedisPwd;
+extern const std::string kDatabaseId;
+} // namespace Redis
+
+namespace Authentication {
+extern const std::string kVerifyEnable;
+extern const std::string kVerifyLicenseHost;
+extern const std::string kVerifyLicensePort;
+extern const std::string kVerifyLicenseAPI;
+} // namespace Authentication
 
 namespace Protocol {
 static constexpr char kFieldName[] = "protocol.";
@@ -369,6 +426,8 @@ extern const std::string kNotFound;
 // 是否显示文件夹菜单  [AUTO-TRANSLATED:77301b85]
 // Whether to display the folder menu
 extern const std::string kDirMenu;
+// 是否启用token鉴权
+extern const std::string kEnableTokenAuth;
 // 禁止缓存文件的后缀  [AUTO-TRANSLATED:92bcb7f7]
 // Forbidden cache file suffixes
 extern const std::string kForbidCacheSuffix;
@@ -430,6 +489,8 @@ extern const std::string kRtpTransportType;
 // //////////RTMP服务器配置///////////  [AUTO-TRANSLATED:8de6f41f]
 // //////////RTMP Server Configuration///////////
 namespace Rtmp {
+// 历史兼容：RTMP时间戳修正开关
+extern const std::string kModifyStamp;
 // 握手超时时间，默认15秒  [AUTO-TRANSLATED:6f69a65b]
 // Handshake timeout, default 15 seconds
 extern const std::string kHandshakeSecond;
@@ -439,6 +500,10 @@ extern const std::string kKeepAliveSecond;
 // 是否直接代理  [AUTO-TRANSLATED:25268b70]
 // Whether direct proxy
 extern const std::string kDirectProxy;
+// chunk size配置
+extern const std::string KChunkSize;
+// 重推超时
+extern const std::string kRePushTimeout;
 // h265-rtmp是否采用增强型(或者国内扩展)  [AUTO-TRANSLATED:4a52d042]
 // Whether h265-rtmp uses enhanced (or domestic extension)
 extern const std::string kEnhanced;
@@ -456,6 +521,12 @@ extern const std::string kAudioMtuSize;
 // rtp包最大长度限制, 单位KB  [AUTO-TRANSLATED:1da42584]
 // Maximum RTP packet length limit, unit KB
 extern const std::string kRtpMaxSize;
+// RTP排序缓存最大个数
+extern const std::string kMaxRtpCount;
+// RTP有序阈值
+extern const std::string kClearCount;
+// RTP端口范围
+extern const std::string kRtpPortRange;
 // rtp 打包时，低延迟开关，默认关闭（为0），h264存在一帧多个slice（NAL）的情况，在这种情况下，如果开启可能会导致画面花屏  [AUTO-TRANSLATED:4cf0cb8d]
 // When RTP is packaged, low latency switch, default off (0), H264 has multiple slices (NAL) in one frame, in this case, if enabled, it may cause screen flickering
 extern const std::string kLowLatency;
@@ -487,6 +558,10 @@ extern const std::string kAppName;
 // 每次流化MP4文件的时长,单位毫秒  [AUTO-TRANSLATED:0add878d]
 // Duration of each MP4 file streaming, in milliseconds
 extern const std::string kSampleMS;
+// 单文件录制秒数
+extern const std::string kFileSecond;
+// 录制路径
+extern const std::string kFilePath;
 // mp4文件写缓存大小  [AUTO-TRANSLATED:9904413d]
 // MP4 file write cache size
 extern const std::string kFileBufSize;
@@ -499,6 +574,10 @@ extern const std::string kFileRepeat;
 // mp4录制文件是否采用fmp4格式  [AUTO-TRANSLATED:12559ae0]
 // Whether to use fmp4 format for MP4 recording files
 extern const std::string kEnableFmp4;
+// HLS录像写入缓冲长度
+extern const std::string kHlsRecordBufferSize;
+// HLS录像存储的productKey列表
+extern const std::string kHlsRecordProductKeys;
 } // namespace Record
 
 // //////////HLS相关配置///////////  [AUTO-TRANSLATED:873cc84c]
@@ -522,6 +601,8 @@ extern const std::string kSegmentRetain;
 // HLS文件写缓存大小  [AUTO-TRANSLATED:81832c8b]
 // HLS file write cache size
 extern const std::string kFileBufSize;
+// HLS存储路径
+extern const std::string kFilePath;
 // 是否广播 ts 切片完成通知  [AUTO-TRANSLATED:a53644a2]
 // Whether to broadcast ts slice completion notification
 extern const std::string kBroadcastRecordTs;
@@ -572,6 +653,28 @@ extern const std::string kUdpRecvSocketBuffer;
 // ps/ts解析后是否等待下一帧以判断本帧是否完整，开启后提高兼容性，但是可能增加延时
 extern const std::string kMergeFrame;
 } // namespace RtpProxy
+
+namespace UdpTs {
+extern const std::string kDumpDir;
+extern const std::string kTimeoutSec;
+} // namespace UdpTs
+
+namespace MediaStorage {
+extern const std::string kEndpoint;
+extern const std::string kAccessId;
+extern const std::string kAccessSecret;
+extern const std::string kEnableHttps;
+extern const std::string kEnable;
+} // namespace MediaStorage
+
+namespace Transcoding {
+extern const std::string kHardEncoder;
+extern const std::string kSoftDecoder;
+extern const std::string kEnableWaterMark;
+extern const std::string kFontsFileDir;
+extern const std::string kGetDeviceNameUrl;
+extern const std::string kGetDeviceNameUsername;
+} // namespace Transcoding
 
 /**
  * rtsp/rtmp播放器、推流器相关设置名，

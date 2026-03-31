@@ -1,0 +1,64 @@
+FROM registry.jingan.com:32008/ja/ja-media-fs-base:v3.5.1 AS builder
+
+ENV TZ=Asia/Shanghai
+ENV LANG=C.UTF-8
+ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig/:/usr/local/lib/pkgconfig/:/usr/lib64/pkgconfig/:/usr/local/openssl/lib/pkgconfig/:/usr/local/ffmpeg/lib/pkgconfig/
+ENV LD_LIBRARY_PATH=/usr/local/ffmpeg/lib/:$LD_LIBRARY_PATH
+
+WORKDIR /build
+COPY . /build/code
+
+RUN set -eux; \
+    # docker build 阶段没有 nvidia runtime 注入时，仍可通过 CUDA stub 完成链接
+    test -s /usr/local/cuda/lib64/stubs/libcuda.so || true; \
+    mkdir -p /build/build; \
+    cd /build/build; \
+    cmake ../code \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DENABLE_OPENSSL=ON \
+      -DENABLE_SRT=ON \
+      -DENABLE_WEBRTC=ON \
+      -DENABLE_FFMPEG=ON \
+      -DENABLE_SERVER=ON \
+      -DENABLE_TESTS=OFF \
+      -DENABLE_PLAYER=OFF \
+      -DENABLE_REDIS=ON \
+      -DENABLE_PROMETHEUS=ON \
+      -DENABLE_S3_STORAGE=ON \
+      -DENABLE_X264=ON \
+      -DENABLE_X86_VIDEO_CODEC_SDK=ON \
+      -DOPENSSL_ROOT_DIR=/usr/local/openssl \
+      -DOPENSSL_LIBRARIES=/usr/local/openssl/lib \
+      -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
+      -DCUDA_NVCC_EXECUTABLE=/usr/local/cuda/bin/nvcc \
+      -DCUDA_CUDA_LIBRARY=/usr/local/cuda/lib64/stubs/libcuda.so; \
+    cmake --build . --target MediaServer -j"$(nproc)"; \
+    mkdir -p /build/apps /build/apps/config /build/apps/Pem /build/apps/log; \
+    cp -a ../code/release/linux/Release/MediaServer /build/apps/; \
+    if [ -f ../code/release/linux/Release/libmk_api.so ]; then cp -a ../code/release/linux/Release/libmk_api.so /build/apps/; fi; \
+    if [ -d ../code/release/linux/Release/www ]; then cp -a ../code/release/linux/Release/www /build/apps/www; fi; \
+    cp -a ../code/conf/config.ini /build/apps/config/config.ini; \
+    if [ -f ../code/default.pem ]; then cp -a ../code/default.pem /build/apps/config/default.pem; fi; \
+    if [ -f ../code/default.pem ]; then cp -a ../code/default.pem /build/apps/config/video.jing-an.com.pem; fi; \
+    if [ -d ../code/Pem ]; then cp -a ../code/Pem/*.pem /build/apps/Pem/ || true; fi; \
+    if [ -d ../code/conf/fonts ]; then cp -a ../code/conf/fonts /build/apps/fonts; fi; \
+    if [ -f ../code/DejaVuSans.ttf ]; then cp -a ../code/DejaVuSans.ttf /build/apps/; fi; \
+    if [ -d ../code/models ]; then cp -a ../code/models /build/apps/models; fi; \
+    if [ -d ../code/3rdpart/Video-Codec-SDK-X86/lib ]; then cp -a ../code/3rdpart/Video-Codec-SDK-X86/lib/* /build/apps/; fi
+
+FROM registry.jingan.com:32008/ja/ja-media-fs-base:v3.5.1
+
+ENV TZ=Asia/Shanghai
+ENV LANG=C.UTF-8
+ENV WORK_DIR=/home/jingansi/apps
+ENV LD_LIBRARY_PATH=/usr/local/ffmpeg/lib/:/usr/local/lib:/home/jingansi/apps/:$LD_LIBRARY_PATH
+
+WORKDIR ${WORK_DIR}
+RUN mkdir -p /data1/coredump \
+    && echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf \
+    && ldconfig
+
+COPY --from=builder /build/apps/ ./
+RUN chmod +x MediaServer
+
+CMD ["./MediaServer", "-c", "config/config.ini", "-s", "config/video.jing-an.com.pem", "-l", "1", "-m", "7"]

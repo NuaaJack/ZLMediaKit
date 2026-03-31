@@ -15,12 +15,27 @@
 #include "Util/onceToken.h"
 #include "Util/util.h"
 #include <assert.h>
+#include <array>
+#include <mutex>
 #include <stdio.h>
 
 using namespace std;
 using namespace toolkit;
 
 namespace mediakit {
+
+static std::mutex s_server_ports_mtx;
+static std::map<std::string, uint16_t> s_server_ports;
+
+void flush_server_ports(const std::map<std::string, uint16_t> &server_ports) {
+    std::lock_guard<std::mutex> lck(s_server_ports_mtx);
+    s_server_ports = server_ports;
+}
+
+std::map<std::string, uint16_t> get_server_ports() {
+    std::lock_guard<std::mutex> lck(s_server_ports_mtx);
+    return s_server_ports;
+}
 
 bool loadIniConfig(const char *ini_path) {
     string ini;
@@ -33,6 +48,28 @@ bool loadIniConfig(const char *ini_path) {
         mINI tmp;
         tmp.parseFile(ini);
 
+        // Legacy config-domain compatibility:
+        // if only old keys exist in config file, copy values into new-domain keys.
+        static const std::array<std::pair<const char *, const char *>, 17> kLegacyAlias = {{
+            {"general.addMuteAudio", "protocol.add_mute_audio"},
+            {"general.publishToHls", "protocol.enable_hls"},
+            {"general.publishToMP4", "protocol.enable_mp4"},
+            {"general.modifyStamp", "protocol.modify_stamp"},
+            {"general.hls_demand", "protocol.hls_demand"},
+            {"general.rtsp_demand", "protocol.rtsp_demand"},
+            {"general.rtmp_demand", "protocol.rtmp_demand"},
+            {"general.ts_demand", "protocol.ts_demand"},
+            {"general.fmp4_demand", "protocol.fmp4_demand"},
+            {"general.enable_audio", "protocol.enable_audio"},
+            {"general.report_start_time", "hook.report_start_time"},
+            {"hls.filePath", "protocol.hls_save_path"},
+            {"record.filePath", "protocol.mp4_save_path"},
+            {"record.fileSecond", "protocol.mp4_max_second"},
+            {"rtp.portRange", "rtp_proxy.port_range"},
+            {"general.internalServerId", "general.mediaServerId"},
+            {"rtmp.modifyStamp", "protocol.modify_stamp"},
+        }};
+
         auto &ref = mINI::Instance();
         for (auto &pr : tmp) {
             if (ref.find(pr.first) == ref.end()) {
@@ -43,6 +80,28 @@ bool loadIniConfig(const char *ini_path) {
                 // 更新键
                 ref[pr.first] = pr.second;
             }
+        }
+
+        for (const auto &alias : kLegacyAlias) {
+            const auto &legacy_key = alias.first;
+            const auto &new_key = alias.second;
+            if (tmp.find(legacy_key) == tmp.end()) {
+                continue;
+            }
+            if (tmp.find(new_key) != tmp.end()) {
+                // New key is explicitly configured; keep new-domain key priority.
+                continue;
+            }
+            auto legacy_it = ref.find(legacy_key);
+            auto new_it = ref.find(new_key);
+            if (legacy_it == ref.end() || new_it == ref.end()) {
+                continue;
+            }
+            if (new_it->second != legacy_it->second) {
+                InfoL << "apply legacy config alias: " << legacy_key << " -> " << new_key
+                      << ", value: " << legacy_it->second;
+            }
+            new_it->second = legacy_it->second;
         }
         // 更新注释和排序
         ref.updateFrom(tmp);
@@ -90,29 +149,67 @@ const string kBroadcastCreateMuxer = "kBroadcastCreateMuxer";
 // General Configuration Items
 namespace General {
 #define GENERAL_FIELD "general."
+const string kInternalServerId = GENERAL_FIELD "internalServerId";
 const string kMediaServerId = GENERAL_FIELD "mediaServerId";
+const string kMediaServerIp = GENERAL_FIELD "mediaServerIp";
+const string kEnablePem = GENERAL_FIELD "enablePem";
+const string kMediaServerPemFile = GENERAL_FIELD "mediaServerPemFile";
+const string kMediaServerPemIp = GENERAL_FIELD "mediaServerPemIp";
 const string kFlowThreshold = GENERAL_FIELD "flowThreshold";
 const string kStreamNoneReaderDelayMS = GENERAL_FIELD "streamNoneReaderDelayMS";
 const string kMaxStreamWaitTimeMS = GENERAL_FIELD "maxStreamWaitMS";
 const string kEnableVhost = GENERAL_FIELD "enableVhost";
 const string kResetWhenRePlay = GENERAL_FIELD "resetWhenRePlay";
 const string kMergeWriteMS = GENERAL_FIELD "mergeWriteMS";
+const string kAddMuteAudio = GENERAL_FIELD "addMuteAudio";
+const string kPublishToHls = GENERAL_FIELD "publishToHls";
+const string kPublishToMP4 = GENERAL_FIELD "publishToMP4";
+const string kModifyStamp = GENERAL_FIELD "modifyStamp";
+const string kHlsDemand = GENERAL_FIELD "hls_demand";
+const string kRtspDemand = GENERAL_FIELD "rtsp_demand";
+const string kRtmpDemand = GENERAL_FIELD "rtmp_demand";
+const string kTSDemand = GENERAL_FIELD "ts_demand";
+const string kFMP4Demand = GENERAL_FIELD "fmp4_demand";
+const string kEnableAudio = GENERAL_FIELD "enable_audio";
 const string kCheckNvidiaDev = GENERAL_FIELD "check_nvidia_dev";
 const string kEnableFFmpegLog = GENERAL_FIELD "enable_ffmpeg_log";
 const string kWaitTrackReadyMS = GENERAL_FIELD "wait_track_ready_ms";
 const string kWaitAudioTrackDataMS = GENERAL_FIELD "wait_audio_track_data_ms";
 const string kWaitAddTrackMS = GENERAL_FIELD "wait_add_track_ms";
 const string kUnreadyFrameCache = GENERAL_FIELD "unready_frame_cache";
+const string kInsertTimestampSei = GENERAL_FIELD "insert_timestamp_sei";
+const string kPrometheusPort = GENERAL_FIELD "prometheus_port";
+const string kReportStartTime = GENERAL_FIELD "report_start_time";
+const string kEnableDynamicPort = GENERAL_FIELD "dynamic_search_port";
+const string kSupportStreamCount = GENERAL_FIELD "support_stream_count";
+const string kMaxHardDecoderCount = GENERAL_FIELD "max_hard_decoder_count";
+const string kInitHardDecoderCount = GENERAL_FIELD "init_hard_decoder_count";
+const string kReWriteFlvSPS = GENERAL_FIELD "rewrite_flv_sps";
 const string kBroadcastPlayerCountChanged = GENERAL_FIELD "broadcast_player_count_changed";
 const string kListenIP = GENERAL_FIELD "listen_ip";
 
 static onceToken token([]() {
+    mINI::Instance()[kInternalServerId] = makeRandStr(16);
+    mINI::Instance()[kMediaServerIp] = "";
+    mINI::Instance()[kEnablePem] = 1;
+    mINI::Instance()[kMediaServerPemFile] = "";
+    mINI::Instance()[kMediaServerPemIp] = "";
     mINI::Instance()[kFlowThreshold] = 1024;
     mINI::Instance()[kStreamNoneReaderDelayMS] = 20 * 1000;
     mINI::Instance()[kMaxStreamWaitTimeMS] = 15 * 1000;
     mINI::Instance()[kEnableVhost] = 0;
     mINI::Instance()[kResetWhenRePlay] = 1;
     mINI::Instance()[kMergeWriteMS] = 0;
+    mINI::Instance()[kAddMuteAudio] = 1;
+    mINI::Instance()[kPublishToHls] = 1;
+    mINI::Instance()[kPublishToMP4] = 0;
+    mINI::Instance()[kModifyStamp] = 0;
+    mINI::Instance()[kHlsDemand] = 0;
+    mINI::Instance()[kRtspDemand] = 0;
+    mINI::Instance()[kRtmpDemand] = 0;
+    mINI::Instance()[kTSDemand] = 0;
+    mINI::Instance()[kFMP4Demand] = 0;
+    mINI::Instance()[kEnableAudio] = 1;
     mINI::Instance()[kMediaServerId] = makeRandStr(16);
     mINI::Instance()[kCheckNvidiaDev] = 1;
     mINI::Instance()[kEnableFFmpegLog] = 0;
@@ -120,11 +217,49 @@ static onceToken token([]() {
     mINI::Instance()[kWaitAudioTrackDataMS] = 1000;
     mINI::Instance()[kWaitAddTrackMS] = 3000;
     mINI::Instance()[kUnreadyFrameCache] = 100;
+    mINI::Instance()[kInsertTimestampSei] = false;
+    mINI::Instance()[kPrometheusPort] = 9146;
+    mINI::Instance()[kReportStartTime] = 300;
+    mINI::Instance()[kEnableDynamicPort] = 1;
+    mINI::Instance()[kSupportStreamCount] = 30;
+    mINI::Instance()[kMaxHardDecoderCount] = 9;
+    mINI::Instance()[kInitHardDecoderCount] = 1;
+    mINI::Instance()[kReWriteFlvSPS] = true;
     mINI::Instance()[kBroadcastPlayerCountChanged] = 0;
     mINI::Instance()[kListenIP] = "::";
 });
 
 } // namespace General
+
+namespace Redis {
+#define REDIS_FIELD "redis."
+const string kRedisHost = REDIS_FIELD "redisHost";
+const string kRedisPort = REDIS_FIELD "redisPort";
+const string kRedisPwd = REDIS_FIELD "redisPassword";
+const string kDatabaseId = REDIS_FIELD "redisDatabaseId";
+
+static onceToken token([]() {
+    mINI::Instance()[kRedisHost] = "";
+    mINI::Instance()[kRedisPort] = "";
+    mINI::Instance()[kRedisPwd] = "";
+    mINI::Instance()[kDatabaseId] = "";
+});
+} // namespace Redis
+
+namespace Authentication {
+#define AUTH_FIELD "authentication."
+const string kVerifyEnable = AUTH_FIELD "verifyEnable";
+const string kVerifyLicenseHost = AUTH_FIELD "verifyHost";
+const string kVerifyLicensePort = AUTH_FIELD "verifyPort";
+const string kVerifyLicenseAPI = AUTH_FIELD "verifyAPI";
+
+static onceToken token([]() {
+    mINI::Instance()[kVerifyEnable] = 1;
+    mINI::Instance()[kVerifyLicenseHost] = "127.0.0.1";
+    mINI::Instance()[kVerifyLicensePort] = "32212";
+    mINI::Instance()[kVerifyLicenseAPI] = "/license/verify";
+});
+} // namespace Authentication
 
 namespace Protocol {
 const string kModifyStamp = string(kFieldName) + "modify_stamp";
@@ -196,6 +331,7 @@ const string kRootPath = HTTP_FIELD "rootPath";
 const string kVirtualPath = HTTP_FIELD "virtualPath";
 const string kNotFound = HTTP_FIELD "notFound";
 const string kDirMenu = HTTP_FIELD "dirMenu";
+const string kEnableTokenAuth = HTTP_FIELD "enableTokenAuth";
 const string kForbidCacheSuffix = HTTP_FIELD "forbidCacheSuffix";
 const string kForwardedIpHeader = HTTP_FIELD "forwarded_ip_header";
 const string kAllowCrossDomains = HTTP_FIELD "allow_cross_domains";
@@ -207,6 +343,7 @@ static onceToken token([]() {
     mINI::Instance()[kKeepAliveSecond] = 15;
     mINI::Instance()[kDirMenu] = true;
     mINI::Instance()[kVirtualPath] = "";
+    mINI::Instance()[kEnableTokenAuth] = true;
     mINI::Instance()[kCharSet] = "utf-8";
 
     mINI::Instance()[kRootPath] = "./www";
@@ -264,15 +401,21 @@ static onceToken token([]() {
 // //////////RTMP Server Configuration///////////
 namespace Rtmp {
 #define RTMP_FIELD "rtmp."
+const string kModifyStamp = RTMP_FIELD "modifyStamp";
 const string kHandshakeSecond = RTMP_FIELD "handshakeSecond";
 const string kKeepAliveSecond = RTMP_FIELD "keepAliveSecond";
 const string kDirectProxy = RTMP_FIELD "directProxy";
+const string KChunkSize = RTMP_FIELD "chunkSize";
+const string kRePushTimeout = RTMP_FIELD "repushTimeout";
 const string kEnhanced = RTMP_FIELD "enhanced";
 
 static onceToken token([]() {
+    mINI::Instance()[kModifyStamp] = false;
     mINI::Instance()[kHandshakeSecond] = 15;
     mINI::Instance()[kKeepAliveSecond] = 15;
     mINI::Instance()[kDirectProxy] = 1;
+    mINI::Instance()[KChunkSize] = 60000;
+    mINI::Instance()[kRePushTimeout] = 15;
     mINI::Instance()[kEnhanced] = 1;
 });
 } // namespace Rtmp
@@ -288,6 +431,9 @@ const string kAudioMtuSize = RTP_FIELD "audioMtuSize";
 // rtp包最大长度限制，单位是KB  [AUTO-TRANSLATED:aee4bffc]
 // Maximum RTP packet length limit, in KB
 const string kRtpMaxSize = RTP_FIELD "rtpMaxSize";
+const string kMaxRtpCount = RTP_FIELD "maxRtpCount";
+const string kClearCount = RTP_FIELD "clearCount";
+const string kRtpPortRange = RTP_FIELD "portRange";
 const string kLowLatency = RTP_FIELD "lowLatency";
 const string kH264StapA = RTP_FIELD "h264_stap_a";
 
@@ -295,6 +441,9 @@ static onceToken token([]() {
     mINI::Instance()[kVideoMtuSize] = 1400;
     mINI::Instance()[kAudioMtuSize] = 600;
     mINI::Instance()[kRtpMaxSize] = 10;
+    mINI::Instance()[kMaxRtpCount] = 50;
+    mINI::Instance()[kClearCount] = 10;
+    mINI::Instance()[kRtpPortRange] = "30000-35000";
     mINI::Instance()[kLowLatency] = 0;
     mINI::Instance()[kH264StapA] = 1;
 });
@@ -327,18 +476,26 @@ namespace Record {
 #define RECORD_FIELD "record."
 const string kAppName = RECORD_FIELD "appName";
 const string kSampleMS = RECORD_FIELD "sampleMS";
+const string kFileSecond = RECORD_FIELD "fileSecond";
+const string kFilePath = RECORD_FIELD "filePath";
 const string kFileBufSize = RECORD_FIELD "fileBufSize";
 const string kFastStart = RECORD_FIELD "fastStart";
 const string kFileRepeat = RECORD_FIELD "fileRepeat";
 const string kEnableFmp4 = RECORD_FIELD "enableFmp4";
+const string kHlsRecordBufferSize = RECORD_FIELD "hlsRecordBufferSize";
+const string kHlsRecordProductKeys = RECORD_FIELD "hlsRecordProductKeys";
 
 static onceToken token([]() {
     mINI::Instance()[kAppName] = "record";
     mINI::Instance()[kSampleMS] = 500;
+    mINI::Instance()[kFileSecond] = 60 * 60;
+    mINI::Instance()[kFilePath] = "./www";
     mINI::Instance()[kFileBufSize] = 64 * 1024;
     mINI::Instance()[kFastStart] = false;
     mINI::Instance()[kFileRepeat] = false;
     mINI::Instance()[kEnableFmp4] = false;
+    mINI::Instance()[kHlsRecordBufferSize] = 300;
+    mINI::Instance()[kHlsRecordProductKeys] = "";
 });
 } // namespace Record
 
@@ -352,6 +509,7 @@ const string kSegmentKeep = HLS_FIELD "segKeep";
 const string kSegmentDelay = HLS_FIELD "segDelay";
 const string kSegmentRetain = HLS_FIELD "segRetain";
 const string kFileBufSize = HLS_FIELD "fileBufSize";
+const string kFilePath = HLS_FIELD "filePath";
 const string kBroadcastRecordTs = HLS_FIELD "broadcastRecordTs";
 const string kDeleteDelaySec = HLS_FIELD "deleteDelaySec";
 const string kFastRegister = HLS_FIELD "fastRegister";
@@ -363,6 +521,7 @@ static onceToken token([]() {
     mINI::Instance()[kSegmentDelay] = 0;
     mINI::Instance()[kSegmentRetain] = 5;
     mINI::Instance()[kFileBufSize] = 64 * 1024;
+    mINI::Instance()[kFilePath] = "./www";
     mINI::Instance()[kBroadcastRecordTs] = false;
     mINI::Instance()[kDeleteDelaySec] = 10;
     mINI::Instance()[kFastRegister] = false;
@@ -399,6 +558,53 @@ static onceToken token([]() {
     mINI::Instance()[kMergeFrame] = 1;
 });
 } // namespace RtpProxy
+
+namespace UdpTs {
+#define UDP_TS_FIELD "udp_ts."
+const string kDumpDir = UDP_TS_FIELD "dumpDir";
+const string kTimeoutSec = UDP_TS_FIELD "timeoutSec";
+
+static onceToken token([]() {
+    mINI::Instance()[kDumpDir] = "";
+    mINI::Instance()[kTimeoutSec] = 30;
+});
+} // namespace UdpTs
+
+namespace MediaStorage {
+#define STORAGE_FIELD "storage."
+const string kEndpoint = STORAGE_FIELD "endpoint";
+const string kAccessId = STORAGE_FIELD "accessId";
+const string kAccessSecret = STORAGE_FIELD "accessSecret";
+const string kEnableHttps = STORAGE_FIELD "enableHttps";
+const string kEnable = STORAGE_FIELD "enable";
+
+static onceToken token([]() {
+    mINI::Instance()[kEndpoint] = "127.0.0.1:32009";
+    mINI::Instance()[kAccessId] = "minio";
+    mINI::Instance()[kAccessSecret] = "minio123";
+    mINI::Instance()[kEnableHttps] = 0;
+    mINI::Instance()[kEnable] = 0;
+});
+} // namespace MediaStorage
+
+namespace Transcoding {
+#define TRANSCODING_FIELD "transcoding."
+const string kHardEncoder = TRANSCODING_FIELD "hardEncoder";
+const string kSoftDecoder = TRANSCODING_FIELD "softDecoder";
+const string kEnableWaterMark = TRANSCODING_FIELD "enableWaterMark";
+const string kFontsFileDir = TRANSCODING_FIELD "fontsFileDir";
+const string kGetDeviceNameUrl = TRANSCODING_FIELD "getDeviceNameUrl";
+const string kGetDeviceNameUsername = TRANSCODING_FIELD "getDeviceNameUsername";
+
+static onceToken token([]() {
+    mINI::Instance()[kHardEncoder] = true;
+    mINI::Instance()[kSoftDecoder] = false;
+    mINI::Instance()[kEnableWaterMark] = true;
+    mINI::Instance()[kFontsFileDir] = "/home/jingansi/apps/config/fonts";
+    mINI::Instance()[kGetDeviceNameUrl] = "";
+    mINI::Instance()[kGetDeviceNameUsername] = "admin";
+});
+} // namespace Transcoding
 
 namespace Client {
 const string kNetAdapter = "net_adapter";

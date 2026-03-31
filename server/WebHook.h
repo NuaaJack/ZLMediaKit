@@ -34,6 +34,7 @@ extern const std::string kTimeoutSec;
 void installWebHook();
 void unInstallWebHook();
 void onProcessExited();
+void set_ssl_file_name(const std::string &ssl_file_name);
 /**
  * 触发http hook请求
  * @param url 请求地址

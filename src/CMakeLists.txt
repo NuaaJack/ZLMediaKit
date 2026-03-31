@@ -26,6 +26,25 @@ file(GLOB MediaKit_SRC_LIST
   ${CMAKE_CURRENT_SOURCE_DIR}/*/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/*/*.h)
 
+if(NOT ENABLE_REDIS)
+  list(REMOVE_ITEM MediaKit_SRC_LIST
+    ${CMAKE_CURRENT_SOURCE_DIR}/Common/RedisTool.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/Common/RedisTool.h)
+endif()
+
+if(NOT ENABLE_PROMETHEUS)
+  list(REMOVE_ITEM MediaKit_SRC_LIST
+    ${CMAKE_CURRENT_SOURCE_DIR}/Common/StreamMonitor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/Common/StreamMonitor.h)
+endif()
+
+if(NOT ENABLE_S3_STORAGE)
+  list(REMOVE_ITEM MediaKit_SRC_LIST
+    ${CMAKE_CURRENT_SOURCE_DIR}/S3/S3Storage.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/S3/S3Storage.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/S3/SafeAwsInclude.h)
+endif()
+
 if(USE_SOLUTION_FOLDERS AND (NOT GROUP_BY_EXPLORER))
   # 在 IDE 中对文件进行分组, 源文件和头文件分开
   set_file_group("${CMAKE_CURRENT_SOURCE_DIR}" ${MediaKit_SRC_LIST})

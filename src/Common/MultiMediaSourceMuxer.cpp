@@ -8,8 +8,10 @@
 * may be found in the AUTHORS file in the root of the source tree.
 */
 
+#include <atomic>
 #include <math.h>
 #include "Common/config.h"
+#include "Common/MultiLinkControl.h"
 #include "MultiMediaSourceMuxer.h"
 #include "Thread/WorkThreadPool.h"
 
@@ -23,6 +25,8 @@ namespace toolkit {
 namespace mediakit {
 
 namespace {
+std::atomic<uint64_t> s_global_input_frame_bytes{0};
+
 class MediaSourceForMuxer : public MediaSource {
 public:
     MediaSourceForMuxer(const MultiMediaSourceMuxer::Ptr &muxer)
@@ -215,7 +219,13 @@ MultiMediaSourceMuxer::MultiMediaSourceMuxer(const MediaTuple& tuple, float dur_
     _create_in_poller = _poller->isCurrentThread();
     _option = option;
     _dur_sec = dur_sec;
+    _real_stream_id = _tuple.stream;
     setMaxTrackCount(option.max_track);
+    _is_acs_sub_stream = MultiLinkControl::parseAcsStream(_tuple.stream, _real_stream_id, _acs_priority);
+    if (_is_acs_sub_stream) {
+        InfoL << "ACS sub stream detected: " << _tuple.shortUrl() << ", real stream: " << _real_stream_id
+              << ", priority: " << _acs_priority;
+    }
 
     if (option.enable_rtmp) {
         _rtmp = std::make_shared<RtmpMediaSourceMuxer>(_tuple, option, std::make_shared<TitleMeta>(dur_sec));
@@ -247,6 +257,19 @@ MultiMediaSourceMuxer::MultiMediaSourceMuxer(const MediaTuple& tuple, float dur_
     NOTICE_EMIT(BroadcastCreateMuxerArgs, Broadcast::kBroadcastCreateMuxer, _delegate, *this);
 }
 
+MultiMediaSourceMuxer::~MultiMediaSourceMuxer() {
+    unregisterAcsMuxer();
+}
+
+void MultiMediaSourceMuxer::unregisterAcsMuxer() {
+    if (!_is_acs_sub_stream) {
+        return;
+    }
+    if (_acs_registered.exchange(false, std::memory_order_relaxed)) {
+        MultiLinkControl::Instance()->unregisterMuxer(_real_stream_id, _tuple.stream);
+    }
+}
+
 void MultiMediaSourceMuxer::setMediaListener(const std::weak_ptr<MediaSourceEvent> &listener) {
     setDelegate(listener);
 
@@ -275,6 +298,10 @@ void MultiMediaSourceMuxer::setMediaListener(const std::weak_ptr<MediaSourceEven
 
 void MultiMediaSourceMuxer::setTrackListener(const std::weak_ptr<Listener> &listener) {
     _track_listener = listener;
+}
+
+uint64_t MultiMediaSourceMuxer::getAndResetGlobalInBytes() {
+    return s_global_input_frame_bytes.exchange(0, std::memory_order_relaxed);
 }
 
 int MultiMediaSourceMuxer::totalReaderCount() const {
@@ -659,6 +686,7 @@ EventPoller::Ptr MultiMediaSourceMuxer::getOwnerPoller(MediaSource &sender) {
 }
 
 bool MultiMediaSourceMuxer::close(MediaSource &sender) {
+    unregisterAcsMuxer();
     MediaSourceEventInterceptor::close(sender);
     _rtmp = nullptr;
     _rtsp = nullptr;
@@ -772,6 +800,10 @@ void MultiMediaSourceMuxer::onAllTrackReady() {
     if (_delegate) {
         _delegate->addTrackCompleted();
     }
+
+    if (_is_acs_sub_stream && !_acs_registered.exchange(true, std::memory_order_relaxed)) {
+        MultiLinkControl::Instance()->registerMuxer(shared_from_this(), _real_stream_id, _acs_priority);
+    }
     InfoL << "stream: " << shortUrl() << " , codec info: " << getTrackInfoStr(this);
 }
 
@@ -830,6 +862,10 @@ bool MultiMediaSourceMuxer::onTrackFrame(const Frame::Ptr &frame_in) {
 
 bool MultiMediaSourceMuxer::onTrackFrame_l(const Frame::Ptr &frame_in) {
     auto frame = frame_in;
+    s_global_input_frame_bytes.fetch_add(frame->size(), std::memory_order_relaxed);
+    if (_is_acs_sub_stream) {
+        MultiLinkControl::Instance()->inputFrame(shared_from_this(), _real_stream_id, _acs_priority, frame);
+    }
     bool ret = false;
     if (_rtmp) {
         ret = _rtmp->inputFrame(frame) ? true : ret;

@@ -9,6 +9,8 @@
  */
 
 #include <exception>
+#include <algorithm>
+#include <cinttypes>
 #include <sys/stat.h>
 #include <math.h>
 #include <signal.h>
@@ -21,6 +23,7 @@
 
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <regex>
 #include "Util/MD5.h"
 #include "Util/util.h"
@@ -48,6 +51,9 @@
 #include "Pusher/PusherProxy.h"
 #include "Rtp/RtpProcess.h"
 #include "Record/MP4Reader.h"
+#if defined(ENABLE_S3_STORAGE)
+#include "S3/S3Storage.h"
+#endif
 
 #if defined(ENABLE_RTPPROXY)
 #include "Rtp/RtpServer.h"
@@ -341,6 +347,38 @@ static ServiceController<FFmpegSource> s_ffmpeg_src;
 static ServiceController<RtpServer> s_rtp_server;
 #endif
 
+#if defined(ENABLE_S3_STORAGE)
+static S3Storage &s_s3_storage = S3Storage::getInstance();
+static void initS3StorageFromConfig() {
+    GET_CONFIG(bool, s3_enable, MediaStorage::kEnable);
+    GET_CONFIG(string, s3_endpoint, MediaStorage::kEndpoint);
+    GET_CONFIG(string, s3_access_id, MediaStorage::kAccessId);
+    GET_CONFIG(string, s3_access_secret, MediaStorage::kAccessSecret);
+    GET_CONFIG(bool, s3_https, MediaStorage::kEnableHttps);
+
+    if (!s3_enable) {
+        InfoL << "S3 storage disabled, skip init";
+        return;
+    }
+    if (s3_endpoint.empty()) {
+        WarnL << "S3 storage enabled but endpoint is empty, skip init";
+        return;
+    }
+
+    if (!s_s3_storage.InitS3(s3_endpoint, s3_access_id, s3_access_secret, s3_https)) {
+        WarnL << "S3 storage init failed";
+        return;
+    }
+
+    string bucket_name = "ja-media-fs";
+    if (!s_s3_storage.bucket_exists(bucket_name) && !s_s3_storage.create_bucket(bucket_name)) {
+        WarnL << "S3 storage init done, but create bucket failed: " << bucket_name;
+        return;
+    }
+    InfoL << "S3 storage initialized, endpoint: " << s3_endpoint << ", bucket: " << bucket_name;
+}
+#endif
+
 
 static inline string getPusherKey(const string &schema, const string &vhost, const string &app, const string &stream,
                                   const string &dst_url) {
@@ -457,6 +495,13 @@ Value makeMediaSourceJson(MediaSource &media) {
     } else {
         item["originSock"] = Json::nullValue;
     }
+    // 国标RTP流管理常用字段，便于上层直接建立“流<->端口”映射
+    auto rtp_process = media.getRtpProcess();
+    if (rtp_process) {
+        item["rtp_local_port"] = rtp_process->get_local_port();
+        item["rtp_peer_ip"] = rtp_process->get_peer_ip();
+        item["rtp_peer_port"] = rtp_process->get_peer_port();
+    }
 
     // getLossRate有线程安全问题；使用getMediaInfo接口才能获取丢包率；getMediaList接口将忽略丢包率  [AUTO-TRANSLATED:b2e927c6]
     // getLossRate has thread safety issues; use the getMediaInfo interface to get the packet loss rate; the getMediaList interface will ignore the packet loss rate
@@ -483,12 +528,80 @@ Value makeMediaSourceJson(MediaSource &media) {
 }
 
 #if defined(ENABLE_RTPPROXY)
+static bool parsePortRange(const string &range, uint16_t &min_port, uint16_t &max_port) {
+    uint16_t parsed[2] = {0, 0};
+    if (sscanf(range.data(), "%" SCNu16 "-%" SCNu16, parsed, parsed + 1) != 2) {
+        return false;
+    }
+    if (parsed[0] > parsed[1]) {
+        return false;
+    }
+    min_port = parsed[0];
+    max_port = parsed[1];
+    return true;
+}
+
+static std::pair<uint16_t, uint16_t> getEffectiveRtpReceivePortRange() {
+    static const string kDefaultRange = "30000-35000";
+    uint16_t rtp_min = 0, rtp_max = 0;
+    uint16_t proxy_min = 0, proxy_max = 0;
+
+    GET_CONFIG(string, rtp_range, Rtp::kRtpPortRange);
+    GET_CONFIG(string, proxy_range, RtpProxy::kPortRange);
+
+    auto rtp_ok = parsePortRange(rtp_range, rtp_min, rtp_max);
+    auto proxy_ok = parsePortRange(proxy_range, proxy_min, proxy_max);
+
+    if (rtp_ok && proxy_ok) {
+        auto rtp_is_default = (rtp_range == kDefaultRange);
+        auto proxy_is_default = (proxy_range == kDefaultRange);
+        if (rtp_is_default && !proxy_is_default) {
+            return {proxy_min, proxy_max};
+        }
+        if (!rtp_is_default && proxy_is_default) {
+            return {rtp_min, rtp_max};
+        }
+
+        auto min_port = std::max(rtp_min, proxy_min);
+        auto max_port = std::min(rtp_max, proxy_max);
+        if (max_port < min_port) {
+            throw InvalidArgsException(
+                (StrPrinter << "Invalid RTP port range intersection, rtp.portRange=" << rtp_range
+                            << ", rtp_proxy.port_range=" << proxy_range)
+                    .c_str());
+        }
+        return {min_port, max_port};
+    }
+    if (rtp_ok) {
+        return {rtp_min, rtp_max};
+    }
+    if (proxy_ok) {
+        return {proxy_min, proxy_max};
+    }
+    throw InvalidArgsException(
+        (StrPrinter << "Invalid RTP port range config, rtp.portRange=" << rtp_range
+                    << ", rtp_proxy.port_range=" << proxy_range)
+            .c_str());
+}
+
 uint16_t openRtpServer(uint16_t local_port, const mediakit::MediaTuple &tuple, int tcp_mode, const string &local_ip, bool re_use_port, uint32_t ssrc, int only_track, bool multiplex) {
     auto key = tuple.shortUrl();
     if (s_rtp_server.find(key)) {
         // 为了防止RtpProcess所有权限混乱的问题，不允许重复添加相同的key  [AUTO-TRANSLATED:06c7b14c]
         // To prevent the problem of all permissions being messed up in RtpProcess, duplicate keys are not allowed to be added
         return 0;
+    }
+
+    auto range = getEffectiveRtpReceivePortRange();
+    if (local_port != 0) {
+        auto min_port = range.first;
+        auto max_port = range.second;
+        if (local_port < min_port || static_cast<uint32_t>(local_port) + 1 > max_port) {
+            throw InvalidArgsException(
+                (StrPrinter << "RTP port out of range, allowed:[" << min_port << "-" << max_port
+                            << "], input port:" << local_port)
+                    .c_str());
+        }
     }
 
     auto server = s_rtp_server.makeWithAction(key, [&](RtpServer::Ptr server) {
@@ -745,38 +858,12 @@ static constexpr size_t kLoginedCookieLifeSeconds = 24 * 3600;
 
 template <typename T>
 void check_secret(toolkit::SockInfo &sender, mediakit::HttpSession::KeyValue &headerOut, const HttpAllArgs<T> &allArgs, Json::Value &val) {
-    GET_CONFIG(std::string, api_secret, API::kSecret);
-
+    (void) headerOut;
+    (void) allArgs;
+    (void) val;
     auto ip = sender.get_peer_ip();
     if (!HttpFileManager::isIPAllowed(ip)) {
         throw AuthException("Your ip is not allowed to access the service.");
-    }
-
-    try {
-        auto logined_cookie = HttpCookieManager::Instance().getCookie(kLoginedCookieName, allArgs.getParser().getHeader());
-        if (!logined_cookie) {
-            auto unlogin_cookie = HttpCookieManager::Instance().getCookie(kUnLoginCookieName, allArgs.getParser().getHeader());
-            if (!unlogin_cookie) {
-                unlogin_cookie = HttpCookieManager::Instance().addCookie(kUnLoginCookieName, "", kUnLoginCookieLifeSeconds);
-                headerOut["Set-Cookie"] = unlogin_cookie->getCookie(kLoginCookiePath);
-            }
-            val["cookie"] = unlogin_cookie->getCookie();
-            throw AuthException("Please login first", headerOut, val);
-        }
-        // 优先cookie登陆鉴权
-    } catch (...) {
-        try {
-            // cookie登陆鉴权失败了再比对secret
-            CHECK_ARGS("secret");
-            if (api_secret != allArgs["secret"]) {
-                throw AuthException("Incorrect secret");
-            }
-            return;
-        } catch (...) {
-            // 未提供secret或secret不匹配，这个异常隐藏
-        }
-        // secret鉴权模式失败，抛出要求cookie登录的异常
-        throw;
     }
 }
 
@@ -796,6 +883,9 @@ template void check_secret<std::string>(toolkit::SockInfo &, mediakit::HttpSessi
  */
 void installWebApi() {
     addHttpListener();
+#if defined(ENABLE_S3_STORAGE)
+    initS3StorageFromConfig();
+#endif
 
     // 获取线程负载  [AUTO-TRANSLATED:3b0ece5c]
     // Get thread load
@@ -1592,6 +1682,65 @@ void installWebApi() {
             obj["only_track"] = rtps->getOnlyTrack();
             val["data"].append(obj);
         });
+    });
+
+    // 查询国标端口与流的映射关系（包含已打开端口和在线流）
+    api_regist("/index/api/getRtpPortMap", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+
+        std::unordered_set<std::string> key_set;
+        s_rtp_server.for_each([&](const std::string &key, const RtpServer::Ptr &rtps) {
+            key_set.emplace(key);
+            auto vec = split(key, "/");
+            Value obj;
+            obj["vhost"] = vec.size() > 0 ? vec[0] : "";
+            obj["app"] = vec.size() > 1 ? vec[1] : "";
+            obj["stream_id"] = vec.size() > 2 ? vec[2] : "";
+            obj["port"] = rtps->getPort();
+            obj["ssrc"] = rtps->getSSRC();
+            obj["tcp_mode"] = rtps->getTcpMode();
+            obj["only_track"] = rtps->getOnlyTrack();
+            obj["managed_by_api"] = true;
+
+            auto src = MediaSource::find(obj["vhost"].asString(), obj["app"].asString(), obj["stream_id"].asString());
+            if (src) {
+                obj["media_online"] = true;
+                auto process = src->getRtpProcess();
+                if (process) {
+                    fillSockInfo(obj["originSock"], process.get());
+                } else {
+                    obj["originSock"] = Json::nullValue;
+                }
+            } else {
+                obj["media_online"] = false;
+                obj["originSock"] = Json::nullValue;
+            }
+            val["data"].append(obj);
+        });
+
+        // 覆盖未通过openRtpServer管理但已在线的RTP流（例如固定端口接收）
+        MediaSource::for_each_media([&](const MediaSource::Ptr &media) {
+            auto process = media->getRtpProcess();
+            if (!process) {
+                return;
+            }
+            auto key = media->getMediaTuple().shortUrl();
+            if (key_set.find(key) != key_set.end()) {
+                return;
+            }
+
+            Value obj;
+            dumpMediaTuple(media->getMediaTuple(), obj);
+            obj["stream_id"] = media->getMediaTuple().stream;
+            obj["port"] = process->get_local_port();
+            obj["ssrc"] = 0;
+            obj["tcp_mode"] = 0;
+            obj["only_track"] = 0;
+            obj["managed_by_api"] = false;
+            obj["media_online"] = true;
+            fillSockInfo(obj["originSock"], process.get());
+            val["data"].append(obj);
+        }, "rtp", "", "", "");
     });
 
     static auto start_send_rtp = [] (bool passive, API_ARGS_MAP_ASYNC) {

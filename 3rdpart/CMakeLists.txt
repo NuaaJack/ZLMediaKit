@@ -42,6 +42,13 @@ update_cached_list(MK_LINK_LIBRARIES jsoncpp)
 
 ##############################################################################
 
+# nlohmann json (header-only)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nlohmann/json.hpp")
+  include_directories(SYSTEM "${CMAKE_CURRENT_SOURCE_DIR}/nlohmann")
+endif()
+
+##############################################################################
+
 # media-server
 set(MediaServer_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/media-server")
 # TODO: 补一个函数处理各种库
@@ -121,6 +128,23 @@ add_subdirectory(ZLToolKit)
 add_library(ZLMediaKit::ToolKit ALIAS ZLToolKit)
 # 添加依赖
 update_cached_list(MK_LINK_LIBRARIES ZLMediaKit::ToolKit)
+
+##############################################################################
+
+if(ENABLE_X86_VIDEO_CODEC_SDK)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Video-Codec-SDK-X86/CMakeLists.txt")
+    add_subdirectory(Video-Codec-SDK-X86 EXCLUDE_FROM_ALL)
+    if(TARGET NvCodecHW)
+      update_cached_list(MK_LINK_LIBRARIES NvCodecHW)
+      update_cached_list(MK_COMPILE_DEFINITIONS ENABLE_X86_VIDEO_CODEC_SDK)
+      message(STATUS "x86 Video Codec SDK enabled")
+    else()
+      message(WARNING "Video-Codec-SDK-X86 target NvCodecHW not found")
+    endif()
+  else()
+    message(WARNING "Video-Codec-SDK-X86 not found under 3rdpart/")
+  endif()
+endif()
 
 ##############################################################################
 
